@@ -1,0 +1,58 @@
+// =============================================================================
+// crowdsec.alloy — CrowdSec security engine metrics
+//
+// Enabled by adding "crowdsec" to enabled_modules in /etc/alloy/alloy.modules.
+//
+// Scrapes CrowdSec's built-in Prometheus metrics endpoint (default port 6060).
+//
+// Prerequisites:
+//   - CrowdSec installed and running
+//   - Prometheus metrics enabled in /etc/crowdsec/config.yaml:
+//       prometheus:
+//         enabled: true
+//         level: full
+//         listen_addr: 127.0.0.1
+//         listen_port: 6060
+//
+// Required environment variables:
+//   GCLOUD_PROM_ENDPOINT    — Grafana Cloud Prometheus remote_write URL
+//   GCLOUD_PROM_USERNAME    — Grafana Cloud Prometheus username
+//   GCLOUD_RW_API_KEY       — Grafana Cloud read/write API key
+// =============================================================================
+
+declare "crowdsec" {
+  argument "metrics_port" {
+    optional = true
+    default  = "6060"
+    comment  = "Port where the CrowdSec metrics endpoint is listening."
+  }
+
+  // ---------------------------------------------------------------------------
+  // CrowdSec metrics scrape
+  // ---------------------------------------------------------------------------
+
+  prometheus.scrape "metrics_integrations_crowdsec" {
+    targets = [{
+      __address__ = join(["localhost:", argument.metrics_port.value], ""),
+      instance    = constants.hostname,
+      app         = "crowdsec",
+    }]
+    forward_to = [prometheus.remote_write.metrics_service.receiver]
+    job_name   = "app-exporter"
+  }
+
+  // ---------------------------------------------------------------------------
+  // Prometheus remote_write endpoint
+  // ---------------------------------------------------------------------------
+
+  prometheus.remote_write "metrics_service" {
+    endpoint {
+      url = sys.env("GCLOUD_PROM_ENDPOINT")
+
+      basic_auth {
+        username = sys.env("GCLOUD_PROM_USERNAME")
+        password = sys.env("GCLOUD_RW_API_KEY")
+      }
+    }
+  }
+}
