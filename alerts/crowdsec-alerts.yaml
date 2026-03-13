@@ -1,0 +1,495 @@
+# =============================================================================
+# crowdsec-alerts.yaml — Grafana alert rules for the CrowdSec security engine
+#
+# Provisioning format: Grafana v10+ (apiVersion: 1)
+#
+# BEFORE IMPORTING:
+#   Replace every occurrence of GRAFANA_CLOUD_PROM_UID with your actual
+#   Grafana Cloud Prometheus datasource UID.
+#   Find it: Grafana → Configuration → Data Sources → your Prometheus source
+#   → copy the UID from the browser URL (e.g. "grafanacloud-prom").
+#
+# IMPORTING (Grafana UI):
+#   Alerting → Alert rules → Import (top-right) → upload this file
+#
+# IMPORTING (Grafana HTTP API):
+#   curl -X POST \
+#     -H "Content-Type: application/yaml" \
+#     -H "Authorization: Bearer <your-api-key>" \
+#     --data-binary @crowdsec-alerts.yaml \
+#     https://<grafana-host>/api/v1/provisioning/alert-rules
+#
+# ALERT INDEX:
+#   1. CrowdSec — Service Down             (critical, 2m)
+#   2. CrowdSec — Parser Failure Rate High (warning,  5m)
+#   3. CrowdSec — No Active Bouncers       (critical, 5m)
+#   4. CrowdSec — Bouncer Not Pulling      (warning, 15m)
+#   5. CrowdSec — Alert Surge Detected     (warning,  5m)
+#   6. CrowdSec — LAPI Error Rate High     (warning,  5m)
+#   7. CrowdSec — Machine Agent Stale      (warning,  5m)
+# =============================================================================
+
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: CrowdSec
+    folder: Security
+    interval: 1m
+    rules:
+
+      # -----------------------------------------------------------------------
+      # 1. Service health — CrowdSec Prometheus metrics absent or target down
+      #
+      # Why it matters (SRE): CrowdSec going down silently means bans still
+      # appear enforced (bouncers cache decisions) but no new threats are being
+      # detected or actioned. The service can fail quietly.
+      #
+      # noDataState: Alerting ensures this fires if the metric disappears
+      # entirely (process crash, port blocked, etc.).
+      # -----------------------------------------------------------------------
+      - uid: crowdsec-service-down
+        title: "CrowdSec — Service Down"
+        condition: Threshold
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: GRAFANA_CLOUD_PROM_UID
+            model:
+              datasource:
+                type: prometheus
+                uid: GRAFANA_CLOUD_PROM_UID
+              expr: 'up{job="app-exporter", app="crowdsec"}'
+              instant: true
+              refId: A
+          - refId: Threshold
+            datasourceUid: "-100"
+            model:
+              conditions:
+                - evaluator:
+                    params: [1]
+                    type: lt
+                  operator:
+                    type: and
+                  query:
+                    params: [A]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: "-100"
+              refId: Threshold
+              type: threshold
+        noDataState: Alerting
+        execErrState: Error
+        for: 2m
+        labels:
+          severity: critical
+          service: crowdsec
+        annotations:
+          summary: "CrowdSec is not reporting on {{ $labels.instance }}"
+          description: |
+            CrowdSec stopped exporting Prometheus metrics on {{ $labels.instance }}.
+            The service may be down or its metrics port (default 6060) is unreachable.
+            New threats are not being detected or actioned while the service is down.
+
+            Investigate:
+              sudo systemctl status crowdsec
+              sudo journalctl -u crowdsec -n 50
+              curl -s http://localhost:6060/metrics | head -5
+          runbook_url: "https://docs.crowdsec.net/docs/troubleshooting/"
+
+      # -----------------------------------------------------------------------
+      # 2. Parse quality — parser failure rate exceeds 10%
+      #
+      # Why it matters (Security): If CrowdSec can't parse log lines, it has
+      # blind spots. Attackers aren't being detected because the evidence isn't
+      # being read. High parse failure can also indicate log format changes
+      # after a software upgrade.
+      #
+      # Why it matters (SRE): Parse failures appear silently — the service
+      # stays running but its effectiveness degrades. This surfaces it.
+      # -----------------------------------------------------------------------
+      - uid: crowdsec-parser-failure-rate-high
+        title: "CrowdSec — Parser Failure Rate High"
+        condition: Threshold
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: GRAFANA_CLOUD_PROM_UID
+            model:
+              datasource:
+                type: prometheus
+                uid: GRAFANA_CLOUD_PROM_UID
+              expr: '100 * sum(rate(cs_parser_hits_ko_total[5m])) / sum(rate(cs_parser_hits_total[5m]))'
+              instant: true
+              refId: A
+          - refId: Threshold
+            datasourceUid: "-100"
+            model:
+              conditions:
+                - evaluator:
+                    params: [10]
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params: [A]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: "-100"
+              refId: Threshold
+              type: threshold
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        labels:
+          severity: warning
+          service: crowdsec
+        annotations:
+          summary: "CrowdSec parser failure rate is elevated on {{ $labels.instance }}"
+          description: |
+            More than 10% of log lines fed to the CrowdSec parser are failing to parse
+            on {{ $labels.instance }}. Detection coverage may be reduced.
+
+            Common causes:
+              - Log format change after application upgrade
+              - New log source not covered by installed parsers
+              - Encoding issues in log files
+
+            Investigate:
+              sudo cscli metrics   (look at parser hit/ok/ko columns per source)
+              sudo cscli parsers list
+              sudo cscli hub update && sudo cscli parsers upgrade --all
+          runbook_url: "https://docs.crowdsec.net/docs/parsers/intro/"
+
+      # -----------------------------------------------------------------------
+      # 3. Bouncer health — no bouncers actively pulling decisions
+      #
+      # Why it matters (Security): Bouncers are the enforcement layer. If no
+      # bouncer is running, CrowdSec can detect threats and issue bans, but
+      # nothing is actually being blocked at the firewall or proxy. This is the
+      # silent failure mode where you have detection but no protection.
+      # -----------------------------------------------------------------------
+      - uid: crowdsec-no-active-bouncers
+        title: "CrowdSec — No Active Bouncers"
+        condition: Threshold
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: GRAFANA_CLOUD_PROM_UID
+            model:
+              datasource:
+                type: prometheus
+                uid: GRAFANA_CLOUD_PROM_UID
+              expr: 'count(count by (bouncer)(cs_lapi_bouncer_requests_total))'
+              instant: true
+              refId: A
+          - refId: Threshold
+            datasourceUid: "-100"
+            model:
+              conditions:
+                - evaluator:
+                    params: [1]
+                    type: lt
+                  operator:
+                    type: and
+                  query:
+                    params: [A]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: "-100"
+              refId: Threshold
+              type: threshold
+        noDataState: Alerting
+        execErrState: Error
+        for: 5m
+        labels:
+          severity: critical
+          service: crowdsec
+        annotations:
+          summary: "No CrowdSec bouncers are active on {{ $labels.instance }}"
+          description: |
+            CrowdSec has no bouncers actively pulling decisions on {{ $labels.instance }}.
+            Banning decisions are NOT being enforced at the network layer.
+            Attackers that CrowdSec has detected are not being blocked.
+
+            Investigate:
+              sudo cscli bouncers list
+              sudo systemctl status crowdsec-firewall-bouncer
+              sudo journalctl -u crowdsec-firewall-bouncer -n 50
+          runbook_url: "https://docs.crowdsec.net/docs/bouncers/"
+
+      # -----------------------------------------------------------------------
+      # 4. Bouncer health — a specific bouncer has gone stale
+      #
+      # Why it matters (SRE): Even when bouncers show as "registered", they
+      # can stop pulling updates. This creates a split-brain where CrowdSec
+      # issues new bans but the bouncer enforces a stale list. Fired per-bouncer.
+      # -----------------------------------------------------------------------
+      - uid: crowdsec-bouncer-stale
+        title: "CrowdSec — Bouncer Not Pulling Decisions"
+        condition: Threshold
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: GRAFANA_CLOUD_PROM_UID
+            model:
+              datasource:
+                type: prometheus
+                uid: GRAFANA_CLOUD_PROM_UID
+              expr: 'rate(cs_lapi_bouncer_requests_total[15m])'
+              instant: true
+              refId: A
+          - refId: Threshold
+            datasourceUid: "-100"
+            model:
+              conditions:
+                - evaluator:
+                    params: [0]
+                    type: lte
+                  operator:
+                    type: and
+                  query:
+                    params: [A]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: "-100"
+              refId: Threshold
+              type: threshold
+        noDataState: NoData
+        execErrState: Error
+        for: 15m
+        labels:
+          severity: warning
+          service: crowdsec
+        annotations:
+          summary: "CrowdSec bouncer {{ $labels.bouncer }} has stopped pulling on {{ $labels.instance }}"
+          description: |
+            The bouncer "{{ $labels.bouncer }}" on {{ $labels.instance }} has not pulled
+            any decisions in the last 15 minutes. It may be stopped or stuck.
+            The decision list it enforces is now stale.
+
+            Investigate:
+              sudo cscli bouncers list
+              sudo systemctl status <bouncer-service-name>
+              sudo journalctl -u <bouncer-service-name> -n 50
+          runbook_url: "https://docs.crowdsec.net/docs/bouncers/"
+
+      # -----------------------------------------------------------------------
+      # 5. Attack detection — sudden surge in new alerts
+      #
+      # Why it matters (Security): A rapid spike in alerts is a strong signal
+      # of a coordinated attack, mass scan, or brute-force campaign hitting the
+      # fleet. Early detection lets you respond before systems are overwhelmed.
+      #
+      # Threshold: 20 new alerts in 5 minutes. Adjust to your fleet's baseline.
+      # -----------------------------------------------------------------------
+      - uid: crowdsec-alert-surge
+        title: "CrowdSec — Alert Surge Detected"
+        condition: Threshold
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: GRAFANA_CLOUD_PROM_UID
+            model:
+              datasource:
+                type: prometheus
+                uid: GRAFANA_CLOUD_PROM_UID
+              expr: 'sum(increase(cs_alerts[5m]))'
+              instant: true
+              refId: A
+          - refId: Threshold
+            datasourceUid: "-100"
+            model:
+              conditions:
+                - evaluator:
+                    params: [20]
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params: [A]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: "-100"
+              refId: Threshold
+              type: threshold
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        labels:
+          severity: warning
+          service: crowdsec
+        annotations:
+          summary: "CrowdSec generated {{ $values.A | humanize }} alerts in 5 min on {{ $labels.instance }}"
+          description: |
+            CrowdSec on {{ $labels.instance }} generated more than 20 new security alerts
+            in 5 minutes, which may indicate a coordinated attack, mass scan, or brute-force
+            campaign. Check the "CrowdSec — Security Overview" dashboard for active scenarios.
+
+            Investigate:
+              sudo cscli alerts list --limit 20
+              sudo cscli decisions list
+              sudo cscli metrics
+          dashboard_uid: "crowdsec-overview"
+
+      # -----------------------------------------------------------------------
+      # 6. Infrastructure health — LAPI error rate elevated
+      #
+      # Why it matters (SRE): LAPI errors mean agents or bouncers are failing
+      # to authenticate or communicate with the local API. This can silently
+      # degrade detection (agents can't push events) or enforcement (bouncers
+      # can't pull decisions).
+      # -----------------------------------------------------------------------
+      - uid: crowdsec-lapi-errors-high
+        title: "CrowdSec — LAPI Error Rate High"
+        condition: Threshold
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: GRAFANA_CLOUD_PROM_UID
+            model:
+              datasource:
+                type: prometheus
+                uid: GRAFANA_CLOUD_PROM_UID
+              expr: '100 * sum(rate(cs_lapi_route_requests_total{code!~"2.."}[5m])) / sum(rate(cs_lapi_route_requests_total[5m]))'
+              instant: true
+              refId: A
+          - refId: Threshold
+            datasourceUid: "-100"
+            model:
+              conditions:
+                - evaluator:
+                    params: [5]
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params: [A]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: "-100"
+              refId: Threshold
+              type: threshold
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        labels:
+          severity: warning
+          service: crowdsec
+        annotations:
+          summary: "CrowdSec LAPI error rate is elevated on {{ $labels.instance }}"
+          description: |
+            The CrowdSec LAPI on {{ $labels.instance }} is returning errors for more than
+            5% of requests. This may indicate authentication failures from agents or
+            bouncers, a certificate issue, or an internal LAPI error.
+
+            Investigate:
+              sudo cscli lapi status
+              sudo cscli machines list
+              sudo cscli bouncers list
+              sudo journalctl -u crowdsec -n 100 | grep -i "error\|fail"
+          runbook_url: "https://docs.crowdsec.net/docs/local_api/intro/"
+
+      # -----------------------------------------------------------------------
+      # 7. Agent connectivity — machine has stopped making LAPI requests
+      #
+      # Why it matters (Security): CrowdSec agents on each host push events to
+      # the LAPI. If a machine stops making requests entirely, that host has
+      # gone dark — attacks against it are not being detected or shared with
+      # the fleet.
+      #
+      # Note: cs_machine_last_push / cs_machine_last_pull were removed in
+      # CrowdSec v1.7. This alert uses cs_lapi_machine_requests_total as the
+      # best available proxy for machine liveness. A machine that makes zero
+      # LAPI requests in 15 minutes is effectively disconnected.
+      # -----------------------------------------------------------------------
+      - uid: crowdsec-machine-stale
+        title: "CrowdSec — Machine Agent Silent"
+        condition: Threshold
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: GRAFANA_CLOUD_PROM_UID
+            model:
+              datasource:
+                type: prometheus
+                uid: GRAFANA_CLOUD_PROM_UID
+              expr: 'rate(cs_lapi_machine_requests_total[15m])'
+              instant: true
+              refId: A
+          - refId: Threshold
+            datasourceUid: "-100"
+            model:
+              conditions:
+                - evaluator:
+                    params: [0]
+                    type: lte
+                  operator:
+                    type: and
+                  query:
+                    params: [A]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: "-100"
+              refId: Threshold
+              type: threshold
+        noDataState: NoData
+        execErrState: Error
+        for: 15m
+        labels:
+          severity: warning
+          service: crowdsec
+        annotations:
+          summary: "CrowdSec machine {{ $labels.machine }} has gone silent on {{ $labels.instance }}"
+          description: |
+            The CrowdSec agent "{{ $labels.machine }}" on {{ $labels.instance }} has made
+            zero LAPI requests in the last 15 minutes. It may be disconnected, stuck,
+            or the host is having problems. Attacks against this host are not being
+            detected or shared with the fleet.
+
+            Investigate:
+              sudo cscli machines list
+              sudo journalctl -u crowdsec -n 50
+              sudo systemctl status crowdsec
+          runbook_url: "https://docs.crowdsec.net/docs/troubleshooting/"
