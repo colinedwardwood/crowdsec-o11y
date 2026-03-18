@@ -275,4 +275,4 @@ For anyone running self-hosted infrastructure â€” homelab to small production â€
 
 ---
 
-*The configuration referenced in this post lives in [charleswhisky/o11y](https://github.com/charleswhisky/o11y). The CrowdSec Alloy module, both dashboards, and all seven alert rules are ready to deploy.*
+*The configuration referenced in this post lives in [colinedwardwood/crowdsec-o11y](https://github.com/colinedwardwood/crowdsec-o11y). The CrowdSec Alloy module, both dashboards, and all seven alert rules are ready to deploy.*
